@@ -1,5 +1,7 @@
 #!/usr/bin/env ruby
 
+### Logging ###
+
 def log(s, prefix = nil)
   s.lines.each do |line|
     if prefix
@@ -11,23 +13,17 @@ def log(s, prefix = nil)
   end
 end
 
-def color(s, color, bold = false)
-  color ||= :blue
-  bold_code = bold ? "1" : "0"
-
+def color(s, color)
   color_code = {
-    :black  => 30,
     :red    => 31,
     :green  => 32,
-    :yellow => 33,
-    :blue   => 34,
-    :purple => 35,
-    :cyan   => 36,
-    :white  => 37,
+    :yellow => 33
   }[color]
-
-  return "\e[#{bold_code};#{color_code}m#{s}\e[0m"
+  "\e[0;#{color_code}m#{s}\e[0m"
 end
+
+
+### Timing ###
 
 def start_timer
   @last_time = Time.now
@@ -38,6 +34,9 @@ def elapsed_time
   @last_time = Time.now
   return t
 end
+
+
+### Git ###
 
 def find_remote_endpoint(name)
   # Locate the remote url.
@@ -68,32 +67,28 @@ def get_current_ref
   return IO.read(".git/HEAD").gsub("ref:", "").gsub("refs/heads/", "").strip
 end
 
-def contains_regex?(strings, regex)
-  strings.each do |string|
-    return true if regex.match(string)
+def git_status()
+  paths = []
+  index_status = `git status --porcelain`
+  index_status.lines.each do |line|
+    if m = /.\s+(.*)/.match(line.strip)
+      paths << m[1]
+    end
   end
-  return false
+
+  return paths.uniq
 end
 
-def contains_prefix?(strings, prefix)
-  strings.each do |string|
-    return true if string.index(prefix) == 0
-  end
-  return false
+def is_git_head?(path)
+  /\.git\/HEAD/.match(path)
 end
 
-def escape_path(path)
-  path.gsub(' ', '\ ')
+def is_git_ref?(path)
+  /\.git\/refs\/heads\//.match(path)
 end
 
-def success?
-  return $?.exitstatus == 0
-end
 
-def exit_loudly(s = nil)
-  log colorize(s || "Exiting...", :red)
-  exit(-1)
-end
+### SSH & SCP ###
 
 def update_remote_head(remote_name, remote_hostname, remote_path, ref)
   log "Updating remote head to #{ref}."
@@ -139,17 +134,8 @@ def delete_remote_file(remote_name, remote_hostname, remote_path, file)
   log "Deleted remote file: #{file} (%0.2f s)" % elapsed_time()
 end
 
-def git_status()
-  paths = []
-  index_status = `git status --porcelain`
-  index_status.lines.each do |line|
-    if m = /.\s+(.*)/.match(line.strip)
-      paths << m[1]
-    end
-  end
 
-  return paths.uniq
-end
+### File Events ###
 
 def get_file_state(path)
   if !File.exists?(path)
@@ -181,33 +167,6 @@ def detect_file_event(previous_state, new_state)
   return nil
 end
 
-def is_git_head?(path)
-  /\.git\/HEAD/.match(path)
-end
-
-def is_git_ref?(path)
-  /\.git\/refs\/heads\//.match(path)
-end
-
-# Begin the timer.
-start_timer()
-
-base_path = (File.expand_path(".") + "/").gsub("//", "/")
-remote_name = ARGV[0] || "origin"
-remote_hostname, remote_path = find_remote_endpoint(remote_name)
-if remote_hostname.nil? || remote_path.nil?
-  remote_name     = ARGV[0]
-  remote_hostname = ARGV[0]
-  remote_path     = ARGV[1]
-end
-
-log "Monitoring #{base_path}"
-log "Spitting to #{remote_name} (HOST: #{remote_hostname} DIRECTORY: #{remote_path})"
-
-# Update the remote repo to be the same as the local repo.
-current_ref = get_current_ref
-update_remote_head(remote_name, remote_hostname, remote_path, current_ref)
-
 def handle_file_events(paths, states, &block)
   (paths + states.keys).uniq.each do |path|
     # Get the states, detect the event.
@@ -227,9 +186,50 @@ def handle_file_events(paths, states, &block)
   end
 end
 
+
+### Other Utilities ###
+
+def escape_path(path)
+  path.gsub(' ', '\ ')
+end
+
+def success?
+  return $?.exitstatus == 0
+end
+
+def exit_loudly(s = nil)
+  log colorize(s || "Exiting...", :red)
+  exit(-1)
+end
+
+
+### MAIN ###
+
+# Begin the timer.
+start_timer()
+
+# Detect the remote endpoint.
+base_path = (File.expand_path(".") + "/").gsub("//", "/")
+remote_name = ARGV[0] || "origin"
+remote_hostname, remote_path = find_remote_endpoint(remote_name)
+if remote_hostname.nil? || remote_path.nil?
+  remote_name     = ARGV[0]
+  remote_hostname = ARGV[0]
+  remote_path     = ARGV[1]
+end
+
+log "Monitoring #{base_path}"
+log "Spitting to #{remote_name}"
+log " - Host: #{remote_hostname}"
+log " - Directory: #{remote_path}"
+
+# Update the remote repo to be the same as the local repo.
+current_ref = get_current_ref
+update_remote_head(remote_name, remote_hostname, remote_path, current_ref)
+
+
 git_file_states = {}
 code_file_states = {}
-
 
 while true
   # Handle branch changes and commits.
