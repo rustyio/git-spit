@@ -1,5 +1,7 @@
 #!/usr/bin/env ruby
 
+require 'uri'
+
 ### Logging ###
 
 def log(s, prefix = nil)
@@ -22,6 +24,72 @@ def color(s, color)
   "\e[0;#{color_code}m#{s}\e[0m"
 end
 
+def success?
+  return $?.exitstatus == 0
+end
+
+class Remote
+  attr_accessor :name
+  attr_accessor :user
+  attr_accessor :host
+  attr_accessor :port
+  attr_accessor :path
+
+  def initialize(name, user, host, port, path)
+    self.name = name
+    self.user = user || `whoami`.strip
+    self.host = host
+    self.port = (port || 22).to_i
+    self.path = normalize_path(path)
+  end
+
+  def endpoint
+    "ssh://#{user}@#{host}:#{port}/#{path}"
+  end
+
+  def ssh(s, chdir = true)
+    if chdir
+      log `ssh #{user}@#{host} -p #{port} '(cd #{escape_path(path)} && #{s})' 2>&1`, name
+    else
+      log `ssh #{user}@#{host} -p #{port} '#{s}' 2>&1`, name
+    end
+    success? or exit_loudly
+  end
+
+  def scp(local_file, remote_file)
+    log `scp -P #{port} #{escape_path(local_file)} #{user}@#{host}:#{escape_path(remote_file)}`, name
+    success? or exit_loudly
+  end
+
+  def git_push(ref)
+    # This handles fast-forwards and new branches.
+    s = `git push #{endpoint} #{ref}:#{ref} 2>&1`
+
+    # If that didn't work, then try a force-with-lease. This handles
+    # when we've changed history.
+    success? or s = `git push --force-with-lease #{endpoint} #{ref}:#{ref} 2>&1`
+
+    # Whatever happens, log the result.
+    log s, name
+    success? or exit_loudly
+  end
+
+  def escape_path(path)
+    path.gsub(' ', '\ ')
+  end
+
+  def normalize_path(path)
+    if path.start_with?("/~")
+      path.slice!(0)
+    end
+
+    return path
+  end
+
+  def exit_loudly(s = nil)
+    raise s || "Exiting."
+  end
+end
 
 ### Timing ###
 
@@ -57,10 +125,24 @@ def find_remote_endpoint(name)
     return
   end
 
-  # Split out the url parts.
-  url = url.gsub(/^ssh:\/\//, "").gsub(/.git$/, "")
-  hostname, *path = url.split("/")
-  return hostname, path.join("/")
+  begin
+    # Parse ssh url.
+    uri = URI(url)
+    raise "#{url} is not an SSH endpoint." unless uri.scheme == "ssh"
+    return Remote.new(name, uri.user, uri.host, (uri.port || "22").to_i, uri.path)
+  rescue URI::InvalidURIError => e
+    # Parse scp url, e.g. "user@server:path/to/repo"
+    /(.+)@(.+):(.+)/.match(url) do |m|
+      return Remote.new(name, m[1], m[2], nil, m[3])
+    end
+
+    # Parse scp url, e.g. "server:path/to/repo"
+    /(.+):(.+)/.match(url) do |m|
+      return Remote.new(name, nil, m[1], nil, m[2])
+    end
+  end
+
+  raise "Could not interpret URL '#{url}'"
 end
 
 def get_current_ref
@@ -90,47 +172,45 @@ end
 
 ### SSH & SCP ###
 
-def update_remote_head(remote_name, remote_hostname, remote_path, ref)
+def update_remote_head(remote, ref)
   log "Updating remote head to #{ref}."
 
   # Allow us to push to the currently checked out branch.
-  log `ssh #{remote_hostname} '(cd #{escape_path(remote_path)} && git config --local receive.denyCurrentBranch false)' 2>&1`, remote_name
-  success? or exit_loudly
+  remote.ssh("git config --local receive.denyCurrentBranch false")
 
   # Push latest commit.
-  log `git push --force-with-lease #{remote_name} #{ref}:#{ref} 2>&1`, remote_name
-  success? or exit_loudly
+  remote.git_push(ref)
 
   # Pushing to a checked out branch can sometimes add files to the
   # index. Reset the index.
-  log `ssh #{remote_hostname} '(cd #{escape_path(remote_path)} && git reset)' 2>&1`, remote_name
-  success? or exit_loudly
+  remote.ssh("git reset")
 
   # Checkout the latest ref. Don't do any kind of forcing, just in
   # case there were remote edits.
-  log `ssh #{remote_hostname} '(cd #{escape_path(remote_path)} && git checkout #{ref})' 2>&1`, remote_name
-  success? or exit_loudly
-
-  log "Done."
+  remote.ssh("git checkout #{ref}")
 end
 
-def update_remote_file(remote_name, remote_hostname, remote_path, file)
+def update_remote_file(remote, file)
   elapsed_time()
-  log `scp #{escape_path(file)} #{remote_hostname}:#{escape_path(File.join(remote_path, file))}`, remote_name
-  success? or exit_loudly
+  remote_file = File.join(remote.path, file)
+
+  # Ensure the directory exists.
+  remote.ssh("mkdir -p #{remote.escape_path(File.dirname(remote_file))}", false)
+
+  # Copy the file.
+  remote.scp(file, remote_file)
   log "Updated remote file: #{file} (%0.2f s)" % elapsed_time()
 end
 
-def update_all_remote_files(remote_name, remote_hostname, remote_path, files)
+def update_all_remote_files(remote, files)
   files.each do |file|
-    update_remote_file(remote_name, remote_hostname, remote_path, file)
+    update_remote_file(remote, file)
   end
 end
 
-def delete_remote_file(remote_name, remote_hostname, remote_path, file)
+def delete_remote_file(remote, file)
   elapsed_time()
-  log `ssh #{remote_hostname} '(cd #{escape_path(remote_path)} && rm #{escape_path(file)})'`, remote_name
-  success? or exit_loudly
+  remote.ssh("rm -f #{remote.escape_path(file)}")
   log "Deleted remote file: #{file} (%0.2f s)" % elapsed_time()
 end
 
@@ -148,27 +228,39 @@ def get_file_state(path)
   }
 end
 
-def detect_file_event(previous_state, new_state)
-  # Check if new.
-  if previous_state.nil? && new_state
-    return :new
+def detect_file_event(old_state, new_state)
+  # Nothing to do.
+  if old_state == new_state
+    return
   end
 
   # Check if deleted.
-  if previous_state && new_state.nil?
+  if new_state.nil?
     return :deleted
   end
 
-  # Check if modified
-  if previous_state != new_state
-    return :modified
+  # Check if new.
+  if old_state.nil?
+    return :new
   end
 
-  return nil
+  return :modified
 end
 
 def handle_file_events(paths, states, &block)
-  (paths + states.keys).uniq.each do |path|
+  file_paths = []
+  (paths + states.keys).each do |path|
+    if File.directory?(path)
+      Dir[File.join(path, "**", "*")].each do |inner_path|
+        next if File.directory?(inner_path)
+        file_paths << inner_path
+      end
+    else
+      file_paths << path
+    end
+  end
+
+  file_paths.uniq.each do |path|
     # Get the states, detect the event.
     old_state = states[path]
     new_state = get_file_state(path)
@@ -187,22 +279,6 @@ def handle_file_events(paths, states, &block)
 end
 
 
-### Other Utilities ###
-
-def escape_path(path)
-  path.gsub(' ', '\ ')
-end
-
-def success?
-  return $?.exitstatus == 0
-end
-
-def exit_loudly(s = nil)
-  log colorize(s || "Exiting...", :red)
-  exit(-1)
-end
-
-
 ### MAIN ###
 
 # Begin the timer.
@@ -211,21 +287,20 @@ start_timer()
 # Detect the remote endpoint.
 base_path = (File.expand_path(".") + "/").gsub("//", "/")
 remote_name = ARGV[0] || "origin"
-remote_hostname, remote_path = find_remote_endpoint(remote_name)
-if remote_hostname.nil? || remote_path.nil?
-  remote_name     = ARGV[0]
-  remote_hostname = ARGV[0]
-  remote_path     = ARGV[1]
+remote = find_remote_endpoint(remote_name)
+if remote.host.nil? || remote.path.nil?
+  remote.name = ARGV[0]
+  remote.host = ARGV[0]
+  remote.path = ARGV[1]
 end
 
 log "Monitoring #{base_path}"
-log "Spitting to #{remote_name}"
-log " - Host: #{remote_hostname}"
-log " - Directory: #{remote_path}"
+log "Spitting to #{remote.name}"
+log "- #{remote.endpoint}"
 
 # Update the remote repo to be the same as the local repo.
 current_ref = get_current_ref
-update_remote_head(remote_name, remote_hostname, remote_path, current_ref)
+update_remote_head(remote, current_ref)
 
 
 git_file_states = {}
@@ -238,17 +313,15 @@ while true
     # Handle branch changes.
     if is_git_head?(path) && event == :modified
       current_ref = get_current_ref
-      update_remote_head(remote_name, remote_hostname, remote_path, current_ref)
-      code_file_states = {}
+      update_remote_head(remote, current_ref)
     end
 
     # Handle commits.
     if is_git_ref?(path) && event == :modified
       current_ref = get_current_ref
       if path.index(current_ref)
-        update_remote_head(remote_name, remote_hostname, remote_path, current_ref)
+        update_remote_head(remote, current_ref)
       end
-      code_file_states = {}
     end
   end
 
@@ -257,12 +330,12 @@ while true
   handle_file_events(code_paths, code_file_states) do |path, event|
     # Handle new or modified events.
     if (event == :new || event == :modified)
-      update_remote_file(remote_name, remote_hostname, remote_path, path)
+      update_remote_file(remote, path)
     end
 
     # Handle deleted events.
     if (event == :deleted)
-      delete_remote_file(remote_name, remote_hostname, remote_path, path)
+      delete_remote_file(remote, path)
     end
   end
 
