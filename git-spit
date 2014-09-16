@@ -1,0 +1,267 @@
+#!/usr/bin/env ruby
+
+require 'listen'
+require 'colorize'
+
+# Trap exit signals.
+Signal.trap("INT") do
+  exit(-1)
+end
+
+def log(s, prefix = nil)
+  s.lines.each do |line|
+    if prefix
+      print "[#{prefix}] ".yellow
+    else
+      print "[local] ".green
+    end
+    print "#{line.strip}\n"
+  end
+end
+
+def start_timer
+  @last_time = Time.now
+end
+
+def elapsed_time
+  t = (Time.now - @last_time)
+  @last_time = Time.now
+  return t
+end
+
+def find_remote_endpoint(name)
+  # Locate the remote url.
+  next_url = false
+  url = nil
+  IO.read(".git/config").lines.each do |line|
+    if /remote\s+"#{name}"/.match(line)
+      next_url = true
+    end
+
+    if next_url && m = /url\s*=(.*)/.match(line)
+      url = m[1].strip
+      break
+    end
+  end
+
+  if url.nil?
+    return
+  end
+
+  # Split out the url parts.
+  url = url.gsub(/^ssh:\/\//, "").gsub(/.git$/, "")
+  hostname, *path = url.split("/")
+  return hostname, path.join("/")
+end
+
+def open_persistent_connection(remote_name, remote_hostname)
+  Thread.new do
+    Signal.trap("INT") do
+      exit(-1)
+    end
+
+    log "Opening remote connection to #{remote_hostname}.", remote_name
+    system("ssh -N #{remote_hostname} 'sleep 9999999999'")
+  end
+end
+
+def get_current_ref
+  return IO.read(".git/HEAD").gsub("ref:", "").gsub("refs/heads/", "").strip
+end
+
+def contains_regex?(strings, regex)
+  strings.each do |string|
+    return true if regex.match(string)
+  end
+  return false
+end
+
+def contains_prefix?(strings, prefix)
+  strings.each do |string|
+    return true if string.index(prefix) == 0
+  end
+  return false
+end
+
+def escape_path(path)
+  path.gsub(' ', '\ ')
+end
+
+def success?
+  return $?.exitstatus == 0
+end
+
+def exit_loudly(s = nil)
+  log (s || "Exiting...").red
+  exit(-1)
+end
+
+def update_remote_head(remote_name, remote_hostname, remote_path, ref)
+  log "Updating remote head to #{ref}."
+
+  # Allow us to push to the currently checked out branch.
+  log `ssh #{remote_hostname} '(cd #{escape_path(remote_path)} && git config --local receive.denyCurrentBranch false)' 2>&1`, remote_name
+  success? or exit_loudly
+
+  # Push latest commit.
+  log `git push --force-with-lease #{remote_name} #{ref}:#{ref} 2>&1`, remote_name
+  success? or exit_loudly
+
+  # Pushing to a checked out branch can sometimes add files to the
+  # index. Reset the index.
+  log `ssh #{remote_hostname} '(cd #{escape_path(remote_path)} && git reset)' 2>&1`, remote_name
+  success? or exit_loudly
+
+  # Checkout the latest ref. Don't do any kind of forcing, just in
+  # case there were remote edits.
+  log `ssh #{remote_hostname} '(cd #{escape_path(remote_path)} && git checkout #{ref})' 2>&1`, remote_name
+  success? or exit_loudly
+
+  log "Done."
+rescue StandardError => e
+  log e.to_s.red
+  raise
+end
+
+def update_remote_file(remote_name, remote_hostname, remote_path, file)
+  elapsed_time()
+  log `scp #{escape_path(file)} #{remote_hostname}:#{escape_path(File.join(remote_path, file))}`, remote_name
+  success? or exit_loudly
+  log "Updated remote file: #{file} (%0.2f s)" % elapsed_time()
+rescue StandardError => e
+  log e.to_s.red
+  raise
+end
+
+def update_all_remote_files(remote_name, remote_hostname, remote_path, files)
+  files.each do |file|
+    update_remote_file(remote_name, remote_hostname, remote_path, file)
+  end
+rescue StandardError => e
+  log e.to_s.red
+  raise
+end
+
+def delete_remote_file(remote_name, remote_hostname, remote_path, file)
+  log `ssh #{remote_hostname} '(cd #{escape_path(remote_path)} && rm #{escape_path(file)})'`, remote_name
+  success? or exit_loudly
+  log "Updated remote file: #{file}"
+rescue StandardError => e
+  log e.to_s.red
+end
+
+def refresh_index(index_modified, index_deleted)
+  # Get our list of modified files from .git.
+  index_status = `git status --porcelain`
+  index_status.lines.each do |line|
+    if m = /D\s+(.*)/.match(line.strip)
+      index_deleted << m[1]
+    elsif m = /.\s+(.*)/.match(line.strip)
+      index_modified << m[1]
+    end
+  end
+
+  # Remove duplicate entries and return.
+  return index_modified.uniq, index_deleted.uniq
+end
+
+# Begin the timer.
+start_timer()
+
+# Keep track of which files have been modified. Calls to `git status` feed
+# into this, but we have to maintain this across multiple cycles of Listen
+# because we may have changed a file, sent it to our remote server, and then
+# reverted it back to its original form. In this case, even though `git
+# status` will tell us that the file hasn't changed, *we* know it has changed.
+index_modified, index_deleted = refresh_index([], [])
+
+base_path = (File.expand_path(".") + "/").gsub("//", "/")
+remote_name = ARGV[0] || "origin"
+remote_hostname, remote_path = find_remote_endpoint(remote_name)
+if remote_hostname.nil? || remote_path.nil?
+  remote_name     = ARGV[0]
+  remote_hostname = ARGV[0]
+  remote_path     = ARGV[1]
+end
+
+log "Monitoring #{base_path}"
+log "Spitting to #{remote_name} (HOST: #{remote_hostname} DIRECTORY: #{remote_path})"
+
+# Open a persistent connection to speed up calls.
+# ssh_thread = open_persistent_connection(remote_name, remote_hostname)
+
+# Update the remote repo to be the same as the local repo.
+current_ref = get_current_ref
+update_remote_head(remote_name, remote_hostname, remote_path, current_ref)
+index_modified, index_deleted = refresh_index(index_modified, index_deleted)
+update_all_remote_files(remote_name, remote_hostname, remote_path, index_modified)
+
+options = {
+  :latency => 0.1,
+  :debug => false,
+  :polling_fallback_message => 'Polling!'
+}
+
+listen_object = Listen.to(".git", base_path, options) do |modified, added, removed|
+  begin
+    print "Handling  some changes.\n"
+
+    # Update our knowledge of the index status.
+    index_modified, index_deleted = refresh_index(index_modified, index_deleted)
+
+    # If we find any added or modified files that git considers (or
+    # considered) modified, then update the file on the remote server.
+    (modified + added).each do |file|
+      print "FILE1 #{file}\n"
+      file = file.gsub(base_path, "").gsub(/^\/+/, "")
+      if contains_prefix?(index_modified, file)
+        update_remote_file(remote_name, remote_hostname, remote_path, file)
+      end
+    end
+
+    # If we find any added or modified files that git considers (or
+    # considered) modified, then update the file on the remote server.
+    removed.each do |file|
+      print "FILE2 #{file}\n"
+      file = file.gsub(base_path, "").gsub(/^\/+/, "")
+      if contains_prefix?(index_deleted, file)
+        delete_remote_file(remote_name, remote_hostname, remote_path, file)
+      end
+    end
+
+    # If our HEAD was changed, then change the remote head.
+    if contains_regex?(modified, /.git\/HEAD$/) || contains_regex?(modified, /.git\/refs\/heads/)
+      print "HEAD\n"
+      current_ref = get_current_ref
+      update_remote_head(remote_name, remote_hostname, remote_path, current_ref)
+
+      # Reset our tracking arrays of what has been modified or removed.
+      index_modified = []
+    end
+  rescue Interrupt => e
+    log e
+    raise e
+  rescue StandardError => e
+    log e
+    raise e
+    exit -1
+  end
+end
+
+# Override the default ignore patterns.
+ignore_patterns = [
+    /\.git\/info/,
+    /\.git\/logs/,
+    /\.git\/objects/,
+    /\.git\/refs\/remotes/,
+    /\.git\/refs\/tags/,
+]
+listen_object.ignore!(ignore_patterns)
+
+begin
+  listen_object.start()
+  # ssh_thread.join()
+  sleep 999999
+ensure
+  listen_object.stop()
+end
