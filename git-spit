@@ -1,16 +1,32 @@
 #!/usr/bin/env ruby
 
-require 'colorize'
-
 def log(s, prefix = nil)
   s.lines.each do |line|
     if prefix
-      print "[#{prefix}] ".yellow
+      print color("[#{prefix}] ", :yellow)
     else
-      print "[local] ".green
+      print color("[local] ", :green)
     end
     print "#{line.strip}\n"
   end
+end
+
+def color(s, color, bold = false)
+  color ||= :blue
+  bold_code = bold ? "1" : "0"
+
+  color_code = {
+    :black  => 30,
+    :red    => 31,
+    :green  => 32,
+    :yellow => 33,
+    :blue   => 34,
+    :purple => 35,
+    :cyan   => 36,
+    :white  => 37,
+  }[color]
+
+  return "\e[#{bold_code};#{color_code}m#{s}\e[0m"
 end
 
 def start_timer
@@ -48,17 +64,6 @@ def find_remote_endpoint(name)
   return hostname, path.join("/")
 end
 
-def open_persistent_connection(remote_name, remote_hostname)
-  Thread.new do
-    Signal.trap("INT") do
-      exit(-1)
-    end
-
-    log "Opening remote connection to #{remote_hostname}.", remote_name
-    system("ssh -N #{remote_hostname} 'sleep 9999999999'")
-  end
-end
-
 def get_current_ref
   return IO.read(".git/HEAD").gsub("ref:", "").gsub("refs/heads/", "").strip
 end
@@ -86,7 +91,7 @@ def success?
 end
 
 def exit_loudly(s = nil)
-  log (s || "Exiting...").red
+  log colorize(s || "Exiting...", :red)
   exit(-1)
 end
 
@@ -112,9 +117,6 @@ def update_remote_head(remote_name, remote_hostname, remote_path, ref)
   success? or exit_loudly
 
   log "Done."
-rescue StandardError => e
-  log e.to_s.red
-  raise
 end
 
 def update_remote_file(remote_name, remote_hostname, remote_path, file)
@@ -122,18 +124,12 @@ def update_remote_file(remote_name, remote_hostname, remote_path, file)
   log `scp #{escape_path(file)} #{remote_hostname}:#{escape_path(File.join(remote_path, file))}`, remote_name
   success? or exit_loudly
   log "Updated remote file: #{file} (%0.2f s)" % elapsed_time()
-rescue StandardError => e
-  log e.to_s.red
-  raise
 end
 
 def update_all_remote_files(remote_name, remote_hostname, remote_path, files)
   files.each do |file|
     update_remote_file(remote_name, remote_hostname, remote_path, file)
   end
-rescue StandardError => e
-  log e.to_s.red
-  raise
 end
 
 def delete_remote_file(remote_name, remote_hostname, remote_path, file)
@@ -141,56 +137,19 @@ def delete_remote_file(remote_name, remote_hostname, remote_path, file)
   log `ssh #{remote_hostname} '(cd #{escape_path(remote_path)} && rm #{escape_path(file)})'`, remote_name
   success? or exit_loudly
   log "Deleted remote file: #{file} (%0.2f s)" % elapsed_time()
-rescue StandardError => e
-  log e.to_s.red
 end
 
-def refresh_index(index_modified, index_deleted)
-  # Get our list of modified files from .git.
+def git_status()
+  paths = []
   index_status = `git status --porcelain`
   index_status.lines.each do |line|
-    if m = /D\s+(.*)/.match(line.strip)
-      index_deleted << m[1]
-    elsif m = /.\s+(.*)/.match(line.strip)
-      index_modified << m[1]
+    if m = /.\s+(.*)/.match(line.strip)
+      paths << m[1]
     end
   end
 
-  # Remove duplicate entries and return.
-  return index_modified.uniq, index_deleted.uniq
+  return paths.uniq
 end
-
-# Begin the timer.
-start_timer()
-
-# Keep track of which files have been modified. Calls to `git status` feed
-# into this, but we have to maintain this across multiple cycles of Listen
-# because we may have changed a file, sent it to our remote server, and then
-# reverted it back to its original form. In this case, even though `git
-# status` will tell us that the file hasn't changed, *we* know it has changed.
-index_modified, index_deleted = refresh_index([], [])
-
-base_path = (File.expand_path(".") + "/").gsub("//", "/")
-remote_name = ARGV[0] || "origin"
-remote_hostname, remote_path = find_remote_endpoint(remote_name)
-if remote_hostname.nil? || remote_path.nil?
-  remote_name     = ARGV[0]
-  remote_hostname = ARGV[0]
-  remote_path     = ARGV[1]
-end
-
-log "Monitoring #{base_path}"
-log "Spitting to #{remote_name} (HOST: #{remote_hostname} DIRECTORY: #{remote_path})"
-
-# Open a persistent connection to speed up calls.
-# ssh_thread = open_persistent_connection(remote_name, remote_hostname)
-
-# Update the remote repo to be the same as the local repo.
-current_ref = get_current_ref
-update_remote_head(remote_name, remote_hostname, remote_path, current_ref)
-
-# index_modified, index_deleted = refresh_index(index_modified, index_deleted)
-# update_all_remote_files(remote_name, remote_hostname, remote_path, index_modified)
 
 def get_file_state(path)
   if !File.exists?(path)
@@ -202,7 +161,6 @@ def get_file_state(path)
     :mtime => File.mtime(path)
   }
 end
-
 
 def detect_file_event(previous_state, new_state)
   # Check if new.
@@ -223,7 +181,6 @@ def detect_file_event(previous_state, new_state)
   return nil
 end
 
-
 def is_git_head?(path)
   /\.git\/HEAD/.match(path)
 end
@@ -232,29 +189,57 @@ def is_git_ref?(path)
   /\.git\/refs\/heads\//.match(path)
 end
 
+# Begin the timer.
+start_timer()
 
-file_states = {}
+base_path = (File.expand_path(".") + "/").gsub("//", "/")
+remote_name = ARGV[0] || "origin"
+remote_hostname, remote_path = find_remote_endpoint(remote_name)
+if remote_hostname.nil? || remote_path.nil?
+  remote_name     = ARGV[0]
+  remote_hostname = ARGV[0]
+  remote_path     = ARGV[1]
+end
 
-while true
-  # Update our knowledge of remote refs.
-  remote_refs = [".git/HEAD"] + Dir[".git/refs/heads/*"]
+log "Monitoring #{base_path}"
+log "Spitting to #{remote_name} (HOST: #{remote_hostname} DIRECTORY: #{remote_path})"
 
-  # Update our knowledge of the index status.
-  index_modified, index_deleted = refresh_index(index_modified, index_deleted)
+# Update the remote repo to be the same as the local repo.
+current_ref = get_current_ref
+update_remote_head(remote_name, remote_hostname, remote_path, current_ref)
 
-  (remote_refs + file_states.keys + index_modified + index_deleted).each do |path|
+def handle_file_events(paths, states, &block)
+  (paths + states.keys).uniq.each do |path|
     # Get the states, detect the event.
-    old_state = file_states[path]
+    old_state = states[path]
     new_state = get_file_state(path)
     event = detect_file_event(old_state, new_state)
 
     # Save the new state.
-    file_states[path] = new_state
+    if new_state
+      states[path] = new_state
+    else
+      states.delete(path)
+    end
 
+    # Call the block.
+    block.call(path, event)
+  end
+end
+
+git_file_states = {}
+code_file_states = {}
+
+
+while true
+  # Handle branch changes and commits.
+  git_paths = [".git/HEAD"] + Dir[".git/refs/heads/*"]
+  handle_file_events(git_paths, git_file_states) do |path, event|
     # Handle branch changes.
     if is_git_head?(path) && event == :modified
       current_ref = get_current_ref
       update_remote_head(remote_name, remote_hostname, remote_path, current_ref)
+      code_file_states = {}
     end
 
     # Handle commits.
@@ -263,11 +248,13 @@ while true
       if path.index(current_ref)
         update_remote_head(remote_name, remote_hostname, remote_path, current_ref)
       end
+      code_file_states = {}
     end
+  end
 
-    # Ignore any other git head or git ref events.
-    next if is_git_head?(path) || is_git_ref?(path)
-
+  # Handle code file changes.
+  code_paths = git_status()
+  handle_file_events(code_paths, code_file_states) do |path, event|
     # Handle new or modified events.
     if (event == :new || event == :modified)
       update_remote_file(remote_name, remote_hostname, remote_path, path)
@@ -276,7 +263,6 @@ while true
     # Handle deleted events.
     if (event == :deleted)
       delete_remote_file(remote_name, remote_hostname, remote_path, path)
-      file_states.delete(path)
     end
   end
 
