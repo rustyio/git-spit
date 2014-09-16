@@ -1,12 +1,6 @@
 #!/usr/bin/env ruby
 
-require 'listen'
 require 'colorize'
-
-# Trap exit signals.
-Signal.trap("INT") do
-  exit(-1)
-end
 
 def log(s, prefix = nil)
   s.lines.each do |line|
@@ -143,9 +137,10 @@ rescue StandardError => e
 end
 
 def delete_remote_file(remote_name, remote_hostname, remote_path, file)
+  elapsed_time()
   log `ssh #{remote_hostname} '(cd #{escape_path(remote_path)} && rm #{escape_path(file)})'`, remote_name
   success? or exit_loudly
-  log "Updated remote file: #{file}"
+  log "Deleted remote file: #{file} (%0.2f s)" % elapsed_time()
 rescue StandardError => e
   log e.to_s.red
 end
@@ -193,75 +188,97 @@ log "Spitting to #{remote_name} (HOST: #{remote_hostname} DIRECTORY: #{remote_pa
 # Update the remote repo to be the same as the local repo.
 current_ref = get_current_ref
 update_remote_head(remote_name, remote_hostname, remote_path, current_ref)
-index_modified, index_deleted = refresh_index(index_modified, index_deleted)
-update_all_remote_files(remote_name, remote_hostname, remote_path, index_modified)
 
-options = {
-  :latency => 0.1,
-  :debug => false,
-  :polling_fallback_message => 'Polling!'
-}
+# index_modified, index_deleted = refresh_index(index_modified, index_deleted)
+# update_all_remote_files(remote_name, remote_hostname, remote_path, index_modified)
 
-listen_object = Listen.to(".git", base_path, options) do |modified, added, removed|
-  begin
-    print "Handling  some changes.\n"
-
-    # Update our knowledge of the index status.
-    index_modified, index_deleted = refresh_index(index_modified, index_deleted)
-
-    # If we find any added or modified files that git considers (or
-    # considered) modified, then update the file on the remote server.
-    (modified + added).each do |file|
-      print "FILE1 #{file}\n"
-      file = file.gsub(base_path, "").gsub(/^\/+/, "")
-      if contains_prefix?(index_modified, file)
-        update_remote_file(remote_name, remote_hostname, remote_path, file)
-      end
-    end
-
-    # If we find any added or modified files that git considers (or
-    # considered) modified, then update the file on the remote server.
-    removed.each do |file|
-      print "FILE2 #{file}\n"
-      file = file.gsub(base_path, "").gsub(/^\/+/, "")
-      if contains_prefix?(index_deleted, file)
-        delete_remote_file(remote_name, remote_hostname, remote_path, file)
-      end
-    end
-
-    # If our HEAD was changed, then change the remote head.
-    if contains_regex?(modified, /.git\/HEAD$/) || contains_regex?(modified, /.git\/refs\/heads/)
-      print "HEAD\n"
-      current_ref = get_current_ref
-      update_remote_head(remote_name, remote_hostname, remote_path, current_ref)
-
-      # Reset our tracking arrays of what has been modified or removed.
-      index_modified = []
-    end
-  rescue Interrupt => e
-    log e
-    raise e
-  rescue StandardError => e
-    log e
-    raise e
-    exit -1
+def get_file_state(path)
+  if !File.exists?(path)
+    return nil
   end
+
+  return {
+    :size  => File.size(path),
+    :mtime => File.mtime(path)
+  }
 end
 
-# Override the default ignore patterns.
-ignore_patterns = [
-    /\.git\/info/,
-    /\.git\/logs/,
-    /\.git\/objects/,
-    /\.git\/refs\/remotes/,
-    /\.git\/refs\/tags/,
-]
-listen_object.ignore!(ignore_patterns)
 
-begin
-  listen_object.start()
-  # ssh_thread.join()
-  sleep 999999
-ensure
-  listen_object.stop()
+def detect_file_event(previous_state, new_state)
+  # Check if new.
+  if previous_state.nil? && new_state
+    return :new
+  end
+
+  # Check if deleted.
+  if previous_state && new_state.nil?
+    return :deleted
+  end
+
+  # Check if modified
+  if previous_state != new_state
+    return :modified
+  end
+
+  return nil
+end
+
+
+def is_git_head?(path)
+  /\.git\/HEAD/.match(path)
+end
+
+def is_git_ref?(path)
+  /\.git\/refs\/heads\//.match(path)
+end
+
+
+file_states = {}
+
+while true
+  # Update our knowledge of remote refs.
+  remote_refs = [".git/HEAD"] + Dir[".git/refs/heads/*"]
+
+  # Update our knowledge of the index status.
+  index_modified, index_deleted = refresh_index(index_modified, index_deleted)
+
+  (remote_refs + file_states.keys + index_modified + index_deleted).each do |path|
+    # Get the states, detect the event.
+    old_state = file_states[path]
+    new_state = get_file_state(path)
+    event = detect_file_event(old_state, new_state)
+
+    # Save the new state.
+    file_states[path] = new_state
+
+    # Handle branch changes.
+    if is_git_head?(path) && event == :modified
+      current_ref = get_current_ref
+      update_remote_head(remote_name, remote_hostname, remote_path, current_ref)
+    end
+
+    # Handle commits.
+    if is_git_ref?(path) && event == :modified
+      current_ref = get_current_ref
+      if path.index(current_ref)
+        update_remote_head(remote_name, remote_hostname, remote_path, current_ref)
+      end
+    end
+
+    # Ignore any other git head or git ref events.
+    next if is_git_head?(path) || is_git_ref?(path)
+
+    # Handle new or modified events.
+    if (event == :new || event == :modified)
+      update_remote_file(remote_name, remote_hostname, remote_path, path)
+    end
+
+    # Handle deleted events.
+    if (event == :deleted)
+      delete_remote_file(remote_name, remote_hostname, remote_path, path)
+      file_states.delete(path)
+    end
+  end
+
+  sleep 0.5
 end
