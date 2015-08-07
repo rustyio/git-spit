@@ -67,7 +67,10 @@ class Remote
 
     # If that didn't work, then try a force-with-lease. This handles
     # when we've changed history.
-    success? or s = `git push --force-with-lease #{endpoint} #{ref}:#{ref} 2>&1`
+    unless success?
+      log "Trying --force-with-lease."
+      s = `git push --force-with-lease=#{ref} #{endpoint} #{ref}:#{ref} 2>&1`
+    end
 
     # Whatever happens, log the result.
     log s, name
