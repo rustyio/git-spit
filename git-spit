@@ -247,6 +247,11 @@ end
 
 ### MAIN ###
 
+if !Dir.exists?(".git")
+  print "Not in a git directory."
+  exit -1
+end
+
 # Begin the timer.
 start_timer()
 
