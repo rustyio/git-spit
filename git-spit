@@ -111,20 +111,9 @@ end
 
 def find_remote_endpoint(name)
   # Locate the remote url.
-  next_url = false
-  url = nil
-  IO.read(".git/config").lines.each do |line|
-    if /remote\s+"#{name}"/.match(line)
-      next_url = true
-    end
-
-    if next_url && m = /url\s*=(.*)/.match(line)
-      url = m[1].strip
-      break
-    end
-  end
-
-  if url.nil?
+  if m = `git remote show -n #{name}`.match("Push\s+URL:(.*)\n")
+    url = m[1].strip
+  else
     return
   end
 
@@ -134,22 +123,21 @@ def find_remote_endpoint(name)
     raise "#{url} is not an SSH endpoint." unless uri.scheme == "ssh"
     return Remote.new(name, uri.user, uri.host, (uri.port || "22").to_i, uri.path)
   rescue URI::InvalidURIError => e
-    # Parse scp url, e.g. "user@server:path/to/repo"
-    /(.+)@(.+):(.+)/.match(url) do |m|
-      return Remote.new(name, m[1], m[2], nil, m[3])
-    end
-
-    # Parse scp url, e.g. "server:path/to/repo"
-    /(.+):(.+)/.match(url) do |m|
-      return Remote.new(name, nil, m[1], nil, m[2])
-    end
+    # Parse scp style url.
+    uri = URI("ssh://" + url.gsub(":", "/"))
+    raise "#{url} is not an SSH endpoint." unless uri.scheme == "ssh"
+    return Remote.new(name, uri.user, uri.host, (uri.port || "22").to_i, uri.path)
   end
 
   raise "Could not interpret URL '#{url}'"
 end
 
-def get_current_ref
-  return IO.read(".git/HEAD").gsub("ref:", "").gsub("refs/heads/", "").strip
+def git_current_branch
+  return `git rev-parse --abbrev-ref HEAD`.strip
+end
+
+def git_current_commit
+  return `git rev-parse HEAD`.strip
 end
 
 def git_status()
@@ -163,15 +151,6 @@ def git_status()
 
   return paths.uniq
 end
-
-def is_git_head?(path)
-  /\.git\/HEAD/.match(path)
-end
-
-def is_git_ref?(path)
-  /\.git\/refs\/heads\//.match(path)
-end
-
 
 ### SSH & SCP ###
 
@@ -221,9 +200,7 @@ end
 ### File Events ###
 
 def get_file_state(path)
-  if !File.exists?(path)
-    return nil
-  end
+  return nil unless File.exists?(path)
 
   return {
     :size  => File.size(path),
@@ -233,20 +210,9 @@ end
 
 def detect_file_event(old_state, new_state)
   # Nothing to do.
-  if old_state == new_state
-    return
-  end
-
-  # Check if deleted.
-  if new_state.nil?
-    return :deleted
-  end
-
-  # Check if new.
-  if old_state.nil?
-    return :new
-  end
-
+  return nil      if old_state == new_state
+  return :deleted if new_state.nil?
+  return :new     if old_state.nil?
   return :modified
 end
 
@@ -269,12 +235,9 @@ def handle_file_events(paths, states, &block)
     new_state = get_file_state(path)
     event = detect_file_event(old_state, new_state)
 
-    # Save the new state.
-    if new_state
-      states[path] = new_state
-    else
-      states.delete(path)
-    end
+    # Update the state.
+    states[path] = new_state
+    states.delete(path) if (event == :deleted)
 
     # Call the block.
     block.call(path, event)
@@ -302,35 +265,23 @@ log "Spitting to #{remote.name}"
 log "- #{remote.endpoint}"
 
 # Update the remote repo to be the same as the local repo.
-current_ref = get_current_ref
-update_remote_head(remote, current_ref)
-
-
-git_file_states = {}
-code_file_states = {}
+current_branch = git_current_branch
+current_commit = git_current_commit
+file_states = {}
+update_remote_head(remote, current_branch)
 
 while true
   # Handle branch changes and commits.
-  git_paths = [".git/HEAD"] + Dir[".git/refs/heads/*"]
-  handle_file_events(git_paths, git_file_states) do |path, event|
-    # Handle branch changes.
-    if is_git_head?(path) && event == :modified
-      current_ref = get_current_ref
-      update_remote_head(remote, current_ref)
-    end
-
-    # Handle commits.
-    if is_git_ref?(path) && event == :modified
-      current_ref = get_current_ref
-      if path.index(current_ref)
-        update_remote_head(remote, current_ref)
-      end
-    end
+  if current_branch != git_current_branch ||
+     current_commit != git_current_commit
+    update_remote_head(remote, current_branch)
+    current_branch = git_current_branch
+    current_commit = git_current_commit
   end
 
   # Handle code file changes.
   code_paths = git_status()
-  handle_file_events(code_paths, code_file_states) do |path, event|
+  handle_file_events(code_paths, file_states) do |path, event|
     # Handle new or modified events.
     if (event == :new || event == :modified)
       update_remote_file(remote, path)
