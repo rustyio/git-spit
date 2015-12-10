@@ -133,7 +133,14 @@ def find_remote_endpoint(name)
 end
 
 def git_current_branch
-  return `git rev-parse --abbrev-ref HEAD`.strip
+  while true do
+    branch = `git rev-parse --abbrev-ref HEAD`.strip
+    # Sometimes this will return HEAD if we are in the middle of a git
+    # operation. In that case, sleep for a bit and retry.
+    break if (branch != "") && (branch != 'HEAD')
+    sleep 0.1
+  end
+  return branch
 end
 
 def git_current_commit
